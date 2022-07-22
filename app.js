@@ -2,7 +2,6 @@ const vorpal = require("vorpal")();
 const fs = require("fs");
 let chalk = vorpal.chalk;
 let axios = require("axios");
-let proxyAgent = require("https-proxy-agent");
 let config = JSON.parse(fs.readFileSync("config.json"));
 let scheduler;
 
