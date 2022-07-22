@@ -1,0 +1,13 @@
+{
+  "name": "twitch-revenue-checker",
+  "version": "1.0.0",
+  "description": "Like no joke imagine paying money for such a easy tool",
+  "main": "app.js",
+  "keywords": [],
+  "author": "Kappador",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^0.27.2",
+    "vorpal": "^1.12.0"
+  }
+}
