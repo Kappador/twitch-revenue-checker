@@ -1,13 +1,21 @@
 const vorpal = require("vorpal")();
 const fs = require("fs");
 let chalk = vorpal.chalk;
-let axios = require("axios");
 let config = JSON.parse(fs.readFileSync("config.json"));
+const needle = require("needle");
+const HttpsProxyAgent = require("https-proxy-agent");
 let scheduler;
 
 if (Object.keys(config).length === 0) {
   console.log(chalk.red("Please run 'setup' to configure the bot"));
 }
+
+console.log(
+  chalk.green("https://discord.gg/") +
+    chalk.cyan("kappa") +
+    chalk.green(" | https://discord.gg/") +
+    chalk.cyan("kappahost \n\n")
+);
 
 vorpal
   .command("setup")
@@ -19,6 +27,12 @@ vorpal
         name: "tokens",
         message: "File path to token file ",
         default: "./tokens.txt",
+      },
+      {
+        type: "confirmation",
+        name: "proxies",
+        default: "Y",
+        message: "Do you want to use proxies? ",
       },
       {
         type: "input",
@@ -36,6 +50,7 @@ vorpal
 
     if (results) {
       this.log(`\n${chalk.blue("|")} Token File: ${results.tokens}`);
+      this.log(`\n${chalk.blue("|")} Proxy Usage: ${results.proxies}`);
       this.log(`${chalk.blue("|")} Discord Webhook: ${results.webhook}`);
       this.log(
         `${chalk.blue("|")} Scheduler Interval: ${results.scheduler_interval}`
@@ -70,12 +85,14 @@ vorpal
       config.webhook = results.webhook == "None" ? null : results.webhook;
 
       config.tokens = [];
-      tokenFile.forEach(async (token) => {
-        returnChannelInfo(token).then((info) => {
-          console.log(info);
+      tokenFile.forEach(async (token, index, array) => {
+        returnChannelInfo({ token }).then((info) => {
           config.tokens.push({
+            login: info.name,
             name: info.displayName,
             token,
+            id: info.id,
+            proxy: null,
           });
           if (results.scheduler) {
             config.scheduler = {
@@ -83,10 +100,93 @@ vorpal
               interval: results.scheduler_interval * 60 * 60 * 1000,
             };
           }
-          fs.writeFileSync("config.json", JSON.stringify(config, null, 2));
-          this.log(chalk.green("✓") + " Setup complete");
+          if (index == array.length - 1) {
+            if (results.proxies != "Y")
+              this.log(chalk.green("✓") + " Setup complete");
+            fs.writeFileSync("config.json", JSON.stringify(config, null, 2));
+          }
         });
       });
+
+      if (results.proxies === "Y") {
+        const proxyHow = await this.prompt([
+          {
+            type: "list",
+            name: "proxy",
+            message: "How do you want to use proxies?",
+            choices: [
+              "Random Proxies for Account",
+              "Specific Proxy for Account",
+            ],
+          },
+        ]);
+
+        if (proxyHow.proxy === "Random Proxies for Account") {
+          let proxies = [];
+          const proxyFilePrompt = await this.prompt([
+            {
+              type: "input",
+              name: "proxyFile",
+              message: "File path to proxy file ",
+              default: "./proxies.txt",
+            },
+          ]);
+          const proxyFile = fs
+            .readFileSync(proxyFilePrompt.proxyFile)
+            .toString()
+            .split("\r\n");
+          if (proxyFile.length < 1) {
+            return this.log(chalk.red("X") + " Proxy file is empty");
+          }
+
+          config.tokens.forEach((token, index, array) => {
+            const randomProxy =
+              proxyFile[Math.floor(Math.random() * proxyFile.length)];
+            token.proxy = `http://${randomProxy}`;
+
+            if (index == array.length - 1) {
+              this.log(chalk.green("✓") + " Setup complete");
+              fs.writeFileSync("config.json", JSON.stringify(config, null, 2));
+            }
+          });
+        } else if (proxyHow.proxy === "Specific Proxy for Account") {
+          const proxyFilePrompt = await this.prompt([
+            {
+              type: "input",
+              name: "proxyFile",
+              message: "File path to proxy file ",
+              default: "./proxies.txt",
+            },
+          ]);
+          const proxyFile = fs
+            .readFileSync(proxyFilePrompt.proxyFile)
+            .toString()
+            .split("\r\n");
+          if (proxyFile.length < 1) {
+            return this.log(chalk.red("X") + " Proxy file is empty");
+          }
+
+          let choices = proxyFile;
+          let promptArray = [];
+          for (let i = 0; i < config.tokens.length; i++) {
+            promptArray.push({
+              type: "list",
+              name: `proxy${i}`,
+              message: `Select which proxy you want to use for account ${config.tokens[i].name}? `,
+              choices,
+            });
+          }
+          const whatever = await this.prompt(promptArray);
+          config.tokens.forEach((token, index, array) => {
+            token.proxy = `http://${whatever[`proxy${index}`]}`;
+
+            if (index == array.length - 1) {
+              this.log(chalk.green("✓") + " Setup complete");
+              fs.writeFileSync("config.json", JSON.stringify(config, null, 2));
+            }
+          });
+        }
+      }
     }
   });
 
@@ -94,12 +194,15 @@ vorpal
   .command("check")
   .description("Check the revenue of a channel")
   .action(async function () {
+    let choices = config.tokens.map((token) => token.name);
+    choices.push("All");
+
     const result = await this.prompt([
       {
         type: "list",
         name: "name",
         message: "Select a channel",
-        choices: config.tokens.map((token) => token.name),
+        choices: choices,
       },
       {
         type: "input",
@@ -109,90 +212,31 @@ vorpal
       },
     ]);
 
+    if (result.name === "All") {
+      const timeoutResult = await this.prompt([
+        {
+          type: "input",
+          default: "5",
+          name: "seconds",
+          message:
+            "Please enter how many seconds you want to wait between each check: ",
+        },
+      ]);
+
+      config.tokens.forEach((token) => {
+        let agent = new HttpsProxyAgent(token.proxy);
+        doTheDoings(result.days, token, agent);
+        setTimeout(() => {}, timeoutResult.seconds * 1000);
+      });
+
+      return;
+    }
+
     const config_token = config.tokens.find(
       (token) => token.name == result.name
     );
-    const channel_info = await returnChannelInfo(config_token.token);
-    fetchRevenue(result.days, config_token.token, channel_info.id).then(
-      (revenue_results) => {
-        this.log(
-          `\nRevenue for ${chalk.cyan(
-            channel_info.displayName
-          )} looking ${chalk.cyan(result.days)} days back`
-        );
-        this.log(`Total Revenue ${chalk.cyan(revenue_results.total)}`);
-        this.log(`Ads Revenue ${chalk.cyan(revenue_results.ads)}`);
-        this.log(`Bits Revenue ${chalk.cyan(revenue_results.bits)}`);
-        this.log(
-          `Prime Subs Revenue ${chalk.cyan(revenue_results.prime_subs)}\n`
-        );
-
-        // convert days to proper date
-        const date_minus_days = new Date();
-        date_minus_days.setDate(date_minus_days.getDate() - result.days);
-        const date_minus_days_string = date_minus_days
-          .toISOString()
-          .split("T")[0];
-        const date = new Date();
-        let description = `${date_minus_days_string} - ${
-          date.toISOString().split("T")[0]
-        }`;
-        if (config.webhook) {
-          let data = {
-            username: "ImaginePaying$50ForSuchATool",
-            avatar_url: "https://trollface.dk/trollfaceONE.png",
-            content: "",
-            tts: false,
-            embeds: [
-              {
-                title: "Revenue for " + channel_info.displayName,
-                color: 31743,
-                description: description,
-                author: {
-                  url: "",
-                },
-                image: {},
-                thumbnail: {},
-                footer: {
-                  text: "https://discord.gg/kappa | https://discord.gg/kappahost",
-                },
-                fields: [
-                  {
-                    name: "Total Revenue",
-                    value: `💵 ${revenue_results.total.toString()} $`,
-                    inline: true,
-                  },
-                  {
-                    name: "Ads Revenue",
-                    value: `💵 ${revenue_results.ads.toString()} $`,
-                    inline: true,
-                  },
-                  {
-                    name: "Bits Revenue",
-                    value: `💵 ${revenue_results.bits.toString()} $`,
-                    inline: true,
-                  },
-                  {
-                    name: "Prime Subs Revenue",
-                    value: `💵 ${revenue_results.prime_subs.toString()} $`,
-                    inline: true,
-                  },
-                ],
-              },
-            ],
-            components: [],
-          };
-          axios({
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            data: JSON.stringify(data),
-            url: config.webhook,
-          });
-        }
-      }
-    );
+    let agent = new HttpsProxyAgent(config_token.proxy);
+    doTheDoings(result.days, config_token, agent);
   });
 vorpal
   .command("scheduler")
@@ -247,87 +291,9 @@ vorpal
 
         scheduler = setInterval(async () => {
           config.tokens.forEach(async (token) => {
-            const channel_info = await returnChannelInfo(token.token);
-            fetchRevenue(30, token.token, channel_info.id).then(
-              (revenue_results) => {
-                this.log(
-                  `\nRevenue for ${chalk.cyan(
-                    channel_info.displayName
-                  )} looking ${chalk.cyan(30)} days back`
-                );
-                this.log(`Total Revenue ${chalk.cyan(revenue_results.total)}`);
-                this.log(`Ads Revenue ${chalk.cyan(revenue_results.ads)}`);
-                this.log(`Bits Revenue ${chalk.cyan(revenue_results.bits)}`);
-                this.log(
-                  `Prime Subs Revenue ${chalk.cyan(
-                    revenue_results.prime_subs
-                  )}\n`
-                );
-
-                const date_minus_days = new Date();
-                date_minus_days.setDate(date_minus_days.getDate() - 30);
-                const date_minus_days_string = date_minus_days
-                  .toISOString()
-                  .split("T")[0];
-                const date = new Date();
-                let description = `${date_minus_days_string} - ${
-                  date.toISOString().split("T")[0]
-                }`;
-                if (config.webhook) {
-                  let data = {
-                    username: "ImaginePaying$50ForSuchATool",
-                    avatar_url: "https://trollface.dk/trollfaceONE.png",
-                    content: "",
-                    tts: false,
-                    embeds: [
-                      {
-                        title: "Revenue for " + channel_info.displayName,
-                        color: 31743,
-                        description: description,
-                        author: {
-                          url: "",
-                        },
-                        image: {},
-                        thumbnail: {},
-                        footer: {},
-                        fields: [
-                          {
-                            name: "Total Revenue",
-                            value: `💵 ${revenue_results.total.toString()} $`,
-                            inline: true,
-                          },
-                          {
-                            name: "Ads Revenue",
-                            value: `💵 ${revenue_results.ads.toString()} $`,
-                            inline: true,
-                          },
-                          {
-                            name: "Bits Revenue",
-                            value: `💵 ${revenue_results.bits.toString()} $`,
-                            inline: true,
-                          },
-                          {
-                            name: "Prime Subs Revenue",
-                            value: `💵 ${revenue_results.prime_subs.toString()} $`,
-                            inline: true,
-                          },
-                        ],
-                      },
-                    ],
-                    components: [],
-                  };
-                  axios({
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                    },
-                    data: JSON.stringify(data),
-                    url: config.webhook,
-                  });
-                  setTimeout(() => {}, 2000);
-                }
-              }
-            );
+            let agent = new HttpsProxyAgent(token.proxy);
+            doTheDoings(30, token, agent);
+            setTimeout(() => {}, 5000);
           });
         }, config.scheduler.interval);
       }
@@ -367,9 +333,105 @@ function getTwitchHeader(token = "") {
   return header;
 }
 
-async function fetchRevenue(days, token, channelid, proxy = null) {
-  let agent = proxy ? new proxyAgent(proxy) : null;
+async function doTheDoings(days = 30, token, agent) {
+  fetchRevenue(days, token, agent).then((fetchRevenueResult) => {
+    setTimeout(() => {}, 2000);
+    const date_minus_days = new Date();
+    date_minus_days.setDate(date_minus_days.getDate() - days);
+    const date_minus_days_string = date_minus_days.toISOString().split("T")[0];
+    const date = new Date();
+    let description = `${date_minus_days_string} - ${
+      date.toISOString().split("T")[0]
+    }`;
 
+    let data = fetchRevenueResult;
+    data.displayName = token.name;
+    data.description = description;
+    sendWebhook(data);
+  });
+}
+
+async function sendWebhook(data) {
+  const date = new Date();
+  const date_string = date.toISOString().toString();
+
+  const currency =
+    data.payout.currency === "USD"
+      ? "$"
+      : data.payout.currency === "EUR"
+      ? "€"
+      : data.payout.currency;
+
+  let webhookData = {
+    username: "Twitch Revenue Checker",
+    avatar_url: "https://trollface.dk/trollfaceONE.png",
+    content: "",
+    tts: false,
+    embeds: [
+      {
+        title: "Revenue for " + data.displayName,
+        color: 31743,
+        description: data.description,
+        author: {
+          url: "https://twitch.kappa.host",
+        },
+        image: {},
+        thumbnail: {},
+        footer: {
+          text: "https://twitch.kappa.host",
+          icon_url: "https://trollface.dk/trollfaceONE.png",
+        },
+        timestamp: date_string,
+        fields: [
+          {
+            name: "Status",
+            value:
+              "```" +
+              `Payout Eligible: ${data.payout.eligible ? "✅" : "❌"}\n` +
+              `Partner: ${data.payout.partnerStatus ? "✅" : "❌"}\n` +
+              `Affiliate: ${data.payout.affiliateStatus ? "✅" : "❌"}\n` +
+              "```",
+            inline: false,
+          },
+          {
+            name: `Revenue for last ${data.revenue.days} days`,
+            value:
+              "```" +
+              `Total: 💵 ${data.revenue.total.toString()} ${currency}\n` +
+              `Ads: 💵 ${data.revenue.ads.toString()} ${currency}\n` +
+              `Bits: 💵 ${data.revenue.bits.toString()} ${currency}\n` +
+              `Prime Subs: 💵 ${data.revenue.prime_subs.toString()} ${currency}` +
+              "```",
+            inline: false,
+          },
+          {
+            name: "Tax",
+            value:
+              "```" +
+              `Royalty Tax: ${data.tax.royalty}%\n` +
+              `Service Tax: ${data.tax.service}%\n` +
+              `Total Tax: ${data.tax.service + data.tax.royalty}%` +
+              "```",
+            inline: false,
+          },
+          {
+            name: "Last Payout",
+            value:
+              "```" +
+              `Total: 💵 ${data.payout.total} ${currency}\n` +
+              `Date: ${data.payout.month}-${data.payout.year}\n` +
+              "```",
+            inline: false,
+          },
+        ],
+      },
+    ],
+    components: [],
+  };
+  needle('post', config.webhook, webhookData, { json: true, headers: { 'Content-Type': 'application/json' } });
+}
+
+async function fetchRevenue(days, token, agent) {
   let date = new Date();
   date.setDate(date.getDate() - days);
   let rfc3339_start = date.toISOString().split(".")[0] + "Z";
@@ -378,154 +440,162 @@ async function fetchRevenue(days, token, channelid, proxy = null) {
   lol.setDate(lol.getDate() + 1);
   let rfc3339_end = lol.toISOString().split(".")[0] + "Z";
 
-  let url = `https://api.twitch.tv/kraken/channels/${channelid}/dashboard/revenues?end_date=${rfc3339_end}&fraction=day&start_date=${rfc3339_start}`;
+  let url = `https://api.twitch.tv/kraken/channels/${token.id}/dashboard/revenues?end_date=${rfc3339_end}&fraction=day&start_date=${rfc3339_start}`;
   return new Promise((resolve, reject) => {
-    axios
-      .get(url, {
+    returnPayoutEligibility(token, agent).then((v2) => {
+      needle("get", url, {
         headers: {
           Accept: "application/vnd.twitchtv.v5+json; charset=UTF-8",
-          Authorization: "OAuth " + token,
+          Authorization: "OAuth " + token.token,
           "Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko",
-          "Content-Type": "application/json; charset=UTF-8",
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36",
-          "Twitch-API-Token": "426832becca19d4e5544edd991cda559",
+          "Twitch-API-Token": "e9ec7e8f6ec7deb58fd8b1f2976cdf02",
         },
-        httpsAgent: agent,
-      })
-      .then((response) => {
+        agent: agent,
+      }).then((response) => {
+        let body = response.body;
         let data = {};
-        data["ads"] = 0.0;
-        data["bits"] = 0.0;
-        data["prime_subs"] = 0.0;
 
-        response.data.ads.forEach((element) => {
-          data["ads"] += parseFloat(element.amount) / 100;
+        data.payout = v2.payout;
+        data.tax = v2.tax;
+
+        data.revenue = {};
+        data.revenue.days = days;
+        data.revenue.total = 0.0;
+        data.revenue.ads = 0.0;
+        data.revenue.bits = 0.0;
+        data.revenue.prime_subs = 0.0;
+
+        body.ads.forEach((element) => {
+          data.revenue.ads += parseFloat(element.amount) / 100;
         });
 
-        response.data.bits.forEach((element) => {
-          data["bits"] += parseFloat(element.amount) / 100;
+        body.bits.forEach((element) => {
+          data.revenue.bits += parseFloat(element.amount) / 100;
         });
 
-        response.data.prime_subscriptions.forEach((element) => {
-          data["prime_subs"] += parseFloat(element.amount) / 100;
+        body.prime_subscriptions.forEach((element) => {
+          data.revenue.prime_subs += parseFloat(element.amount) / 100;
         });
 
-        // round up to 2 decimal places
-        data["ads"] = Math.round(data["ads"] * 100) / 100;
-        data["bits"] = Math.round(data["bits"] * 100) / 100;
-        data["prime_subs"] = Math.round(data["prime_subs"] * 100) / 100;
+        data.revenue.ads = Math.round(data.revenue.ads * 100) / 100;
+        data.revenue.bits = Math.round(data.revenue.bits * 100) / 100;
+        data.revenue.prime_subs =
+          Math.round(data.revenue.prime_subs * 100) / 100;
 
-        data["total"] = data["ads"] + data["bits"] + data["prime_subs"];
+        data.revenue.total =
+          data.revenue.ads + data.revenue.bits + data.revenue.prime_subs;
         resolve(data);
       });
+    });
   });
-}
-
-function test() {
-  let response = {
-    data: {
-      twitch_subscriptions: [
-        { product_id: "400840638", default_price: 499, revenue: [] },
-      ],
-      gift_subscriptions: [
-        { product_id: "400840638", default_price: 499, revenue: [] },
-      ],
-      ads: [
-        { timestamp: "2022-06-24T00:00:00Z", amount: 97.65 },
-        { timestamp: "2022-06-26T00:00:00Z", amount: 49.7 },
-        { timestamp: "2022-06-29T00:00:00Z", amount: 111.3 },
-        { timestamp: "2022-06-25T00:00:00Z", amount: 27.3 },
-        { timestamp: "2022-06-27T00:00:00Z", amount: 67.2 },
-        { timestamp: "2022-07-01T00:00:00Z", amount: 13.65 },
-        { timestamp: "2022-07-07T00:00:00Z", amount: 303.45 },
-        { timestamp: "2022-07-20T00:00:00Z", amount: 126 },
-        { timestamp: "2022-07-09T00:00:00Z", amount: 37.8 },
-        { timestamp: "2022-07-16T00:00:00Z", amount: 53.55 },
-        { timestamp: "2022-07-08T00:00:00Z", amount: 229.25 },
-        { timestamp: "2022-07-10T00:00:00Z", amount: 233.45 },
-        { timestamp: "2022-07-18T00:00:00Z", amount: 141.05 },
-        { timestamp: "2022-07-15T00:00:00Z", amount: 98.7 },
-        { timestamp: "2022-07-17T00:00:00Z", amount: 320.25 },
-        { timestamp: "2022-07-12T00:00:00Z", amount: 114.8 },
-        { timestamp: "2022-07-06T00:00:00Z", amount: 185.5 },
-      ],
-      bits: [
-        { timestamp: "2022-07-08T00:00:00Z", amount: 400 },
-        { timestamp: "2022-07-20T00:00:00Z", amount: 1000 },
-      ],
-      prime_subscriptions: [
-        { timestamp: "2022-07-01T00:00:00Z", amount: 878 },
-        { timestamp: "2022-07-06T00:00:00Z", amount: 157 },
-        { timestamp: "2022-07-10T00:00:00Z", amount: 423.5 },
-        { timestamp: "2022-07-21T00:00:00Z", amount: 848.5 },
-      ],
-      bounty_board: [],
-      ad_polls: [],
-      game_commerce: [],
-      extensions: [],
-      polls: [],
-      multi_month_gift_subscriptions: [],
-      experimental: [],
-    },
-  };
-
-  let data = {};
-
-  data["ads"] = 0.0;
-  data["bits"] = 0.0;
-  data["prime_subs"] = 0.0;
-
-  response.data.ads.forEach((element) => {
-    data["ads"] += parseFloat(element.amount) / 100;
-  });
-
-  response.data.bits.forEach((element) => {
-    data["bits"] += parseFloat(element.amount) / 100;
-  });
-
-  response.data.prime_subscriptions.forEach((element) => {
-    data["prime_subs"] += parseFloat(element.amount) / 100;
-  });
-
-  // round up to 2 decimal places
-  data["ads"] = Math.round(data["ads"] * 100) / 100;
-  data["bits"] = Math.round(data["bits"] * 100) / 100;
-  data["prime_subs"] = Math.round(data["prime_subs"] * 100) / 100;
-
-  data["total"] = data["ads"] + data["bits"] + data["prime_subs"];
-  console.log(data);
 }
 
 async function returnChannelInfo(token) {
   return new Promise((resolve, reject) => {
-    axios
-      .post(
-        "https://gql.twitch.tv/gql",
-        [
-          {
-            operationName: "Settings_ProfilePage_AccountInfoSettings",
-            variables: {},
-            extensions: {
-              persistedQuery: {
-                version: 1,
-                sha256Hash:
-                  "60a54ebcbd29e095db489ed6268f33d5fe5ed1d4fa3176668d8091587ae81779",
-              },
+    needle(
+      "post",
+      "https://gql.twitch.tv/gql",
+      [
+        {
+          operationName: "Settings_ProfilePage_AccountInfoSettings",
+          variables: {},
+          extensions: {
+            persistedQuery: {
+              version: 1,
+              sha256Hash:
+                "60a54ebcbd29e095db489ed6268f33d5fe5ed1d4fa3176668d8091587ae81779",
             },
           },
-        ],
-        {
-          headers: getTwitchHeader(token),
-        }
-      )
-      .then((response) => {
-        resolve({
-          name: response.data[0].data.currentUser.login,
-          displayName: response.data[0].data.currentUser.displayName,
-          id: response.data[0].data.currentUser.id,
-        });
+        },
+      ],
+      {
+        json: true,
+        headers: getTwitchHeader(token.token),
+      }
+    ).then((response) => {
+      let body = response.body;
+      resolve({
+        name: body[0].data.currentUser.login,
+        displayName: body[0].data.currentUser.displayName,
+        id: body[0].data.currentUser.id,
       });
+    });
+  });
+}
+
+async function returnPayoutEligibility(token, agent) {
+  return new Promise((resolve, reject) => {
+    needle(
+      "post",
+      "https://gql.twitch.tv/gql",
+      [
+        {
+          operationName: "PayoutEligibility",
+          variables: {},
+          extensions: {
+            persistedQuery: {
+              version: 1,
+              sha256Hash:
+                "c59902f371ff2bd4f4ad62fc4113732a1412063426a6b0f9338d7474d1766a45",
+            },
+          },
+        },
+        {
+          operationName: "PayoutBalanceV2",
+          variables: {},
+          extensions: {
+            persistedQuery: {
+              version: 1,
+              sha256Hash:
+                "ef8862395a34090d6bbd38f845c30e362fe5517ae73470a388d753a51bb4de1e",
+            },
+          },
+        },
+        {
+          operationName: "AdsSettingsSection_Query",
+          variables: {
+            login: token.login,
+            shouldSkipCIP: false,
+          },
+          extensions: {
+            persistedQuery: {
+              version: 1,
+              sha256Hash:
+                "2661b78ffc4a0bd4678b890693357c0eca6a4c7e2953caf700c38a250d7aab52",
+            },
+          },
+        },
+      ],
+      {
+        json: true,
+        headers: getTwitchHeader(token.token),
+        agent: agent,
+      }
+    ).then((response) => {
+      let body = response.body;
+      resolve({
+        payout: {
+          partnerStatus: body[2].data.user.roles.isPartner,
+          affiliateStatus: body[2].data.user.roles.isAffiliate,
+          eligible: body[1].data.currentUser.payableStatus.isPayable
+            ? true
+            : false,
+          total:
+            body[1].data.currentUser.payoutBalance.currentPayoutBalanceAmount,
+          currency: body[1].data.currentUser.payoutBalance.currency,
+          month: body[1].data.currentUser.payoutBalance.month,
+          year: body[1].data.currentUser.payoutBalance.year,
+        },
+        tax: {
+          royalty: body[0].data.currentUser.withholdingTaxDetail.royaltyTaxRate,
+          service: body[0].data.currentUser.withholdingTaxDetail.serviceTaxRate,
+        },
+        id: body[0].data.currentUser.id,
+      });
+    });
   });
 }
 
